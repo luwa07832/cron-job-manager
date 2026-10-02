@@ -103,6 +103,66 @@ go run .
 
 无匹配时返回 HTTP 200 与空数组 `[]`。
 
+### `POST /api/v1/jobs/{id}/runs`
+
+为任务登记一次执行（只记录，不会启动任何外部命令）。`run_id` 由服务生成，首个结果的 `attempt` 为 `1`。请求体：
+
+```json
+{
+  "scheduled_for": "2026-10-02T01:30:00Z",
+  "started_at": "2026-10-02T01:30:05Z",
+  "finished_at": "2026-10-02T01:31:00Z",
+  "outcome": "failed",
+  "error": "exit status 1"
+}
+```
+
+- 所有时间均为 UTC RFC3339（允许携带偏移量，服务会归一化为 UTC）；`started_at` 不得早于 `scheduled_for`，`finished_at` 不得早于 `started_at`（相等允许）。
+- `outcome` 仅允许 `succeeded` 或 `failed`：成功时 `error` 省略或为 `null`；失败时 `error` 必须是非空白字符串。
+- 成功返回 HTTP 201，结构与 `GET .../runs/{run_id}` 相同。
+
+### `POST /api/v1/jobs/{id}/runs/{run_id}/retries`
+
+为已有执行追加一次重试，`attempt` 在该执行上递增，`scheduled_for` 沿用首次登记的值。请求体不含 `scheduled_for`：
+
+```json
+{
+  "started_at": "2026-10-02T02:30:00Z",
+  "finished_at": "2026-10-02T02:31:00Z",
+  "outcome": "succeeded"
+}
+```
+
+仅当该执行最新一个结果为 `failed` 时允许重试，否则返回 409 `retry_not_allowed`。成功返回 HTTP 201 与该执行的完整结果列表。
+
+### `GET /api/v1/jobs/{id}/runs/{run_id}`
+
+返回单次执行的 `scheduled_for` 与全部结果，结果按 `attempt` 升序：
+
+```json
+{
+  "run_id": "3f1c...",
+  "job_id": "9d2e...",
+  "scheduled_for": "2026-10-02T01:30:00Z",
+  "results": [
+    {"attempt": 1, "started_at": "...", "finished_at": "...", "outcome": "failed", "error": "exit status 1"},
+    {"attempt": 2, "started_at": "...", "finished_at": "...", "outcome": "succeeded", "error": null}
+  ]
+}
+```
+
+### `GET /api/v1/jobs?state=executed&from=...&to=...`
+
+按 `scheduled_for` 查询窗口 `[from, to)` 内已登记的执行结果；每个重试结果各占一行，包含软删除任务的历史。返回按 `scheduled_for`、`job_id`、`run_id`、`attempt` 升序：
+
+```json
+[
+  {"job_id": "...", "run_id": "...", "scheduled_for": "...", "attempt": 1, "started_at": "...", "finished_at": "...", "outcome": "succeeded", "error": null}
+]
+```
+
+无匹配时返回 HTTP 200 与空数组 `[]`。任务软删除后拒绝登记新的执行与重试，但历史仍可通过本接口和单次执行查询读取。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。
@@ -114,6 +174,10 @@ go run .
 | 400 | `time_window_invalid` | 时间戳格式错误、`from` 不早于 `to`，或 `state` 不支持 |
 | 404 | `job_not_found` | 读取、修改或删除的任务不存在或已删除 |
 | 404 | `route_not_found` | 请求未匹配任何路由 |
+| 404 | `run_not_found` | 读取或重试的执行不存在 |
+| 409 | `retry_not_allowed` | 执行最新结果不是 `failed`，不能追加重试 |
+| 422 | `run_time_invalid` | 执行时间缺失或不满足先后关系 |
+| 422 | `run_outcome_invalid` | `outcome` 不合法，或 `error` 与成败状态不一致 |
 | 422 | `name_required` | 名称为空或仅空白 |
 | 422 | `name_conflict` | 名称与其他未删除任务重复 |
 | 422 | `schedule_invalid` | cron 表达式语法非法或不存在可到达的触发时刻 |

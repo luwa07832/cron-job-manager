@@ -204,7 +204,11 @@ func deleteJob(st *store.Store) gin.HandlerFunc {
 
 func listPendingJobs(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if state := c.Query("state"); state != "" && state != "pending" {
+		state := c.Query("state")
+		if state == "" {
+			state = "pending"
+		}
+		if state != "pending" && state != "executed" {
 			writeJobError(c, errTimeWindowInvalid)
 			return
 		}
@@ -226,6 +230,29 @@ func listPendingJobs(st *store.Store) gin.HandlerFunc {
 		}
 		if !from.Before(to) {
 			writeJobError(c, errTimeWindowInvalid)
+			return
+		}
+
+		if state == "executed" {
+			attempts, err := st.ExecutedAttempts(from.UTC(), to.UTC())
+			if err != nil {
+				writeJobError(c, errStorageUnavailable)
+				return
+			}
+			responses := make([]executedRunResponse, 0, len(attempts))
+			for _, attempt := range attempts {
+				responses = append(responses, executedRunResponse{
+					JobID:        attempt.JobID,
+					RunID:        attempt.RunID,
+					ScheduledFor: formatTime(attempt.ScheduledFor),
+					Attempt:      attempt.Attempt,
+					StartedAt:    formatTime(attempt.StartedAt),
+					FinishedAt:   formatTime(attempt.FinishedAt),
+					Outcome:      attempt.Outcome,
+					Error:        attempt.Error,
+				})
+			}
+			c.JSON(http.StatusOK, responses)
 			return
 		}
 
@@ -356,6 +383,22 @@ var (
 	errJobNotFound = &jobError{
 		status: http.StatusNotFound, code: "job_not_found",
 		message: "the requested job does not exist",
+	}
+	errRunNotFound = &jobError{
+		status: http.StatusNotFound, code: "run_not_found",
+		message: "the requested run does not exist",
+	}
+	errRetryNotAllowed = &jobError{
+		status: http.StatusConflict, code: "retry_not_allowed",
+		message: "only the latest result of a failed run can be retried",
+	}
+	errRunTimeInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "run_time_invalid",
+		message: "started_at must not precede scheduled_for and finished_at must not precede started_at",
+	}
+	errRunOutcomeInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "run_outcome_invalid",
+		message: "outcome must be succeeded or failed, with error omitted on success and non-blank on failure",
 	}
 	errStorageUnavailable = &jobError{
 		status: http.StatusServiceUnavailable, code: "storage_unavailable",

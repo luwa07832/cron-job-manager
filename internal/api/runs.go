@@ -1,0 +1,267 @@
+package api
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/luwa07832/cron-job-manager/internal/store"
+)
+
+type createRunRequest struct {
+	ScheduledFor *string `json:"scheduled_for"`
+	StartedAt    string  `json:"started_at"`
+	FinishedAt   string  `json:"finished_at"`
+	Outcome      string  `json:"outcome"`
+	Error        *string `json:"error"`
+}
+
+type retryRunRequest struct {
+	StartedAt  string  `json:"started_at"`
+	FinishedAt string  `json:"finished_at"`
+	Outcome    string  `json:"outcome"`
+	Error      *string `json:"error"`
+}
+
+type attemptResponse struct {
+	Attempt    int     `json:"attempt"`
+	StartedAt  string  `json:"started_at"`
+	FinishedAt string  `json:"finished_at"`
+	Outcome    string  `json:"outcome"`
+	Error      *string `json:"error"`
+}
+
+type runResponse struct {
+	RunID        string            `json:"run_id"`
+	JobID        string            `json:"job_id"`
+	ScheduledFor string            `json:"scheduled_for"`
+	Results      []attemptResponse `json:"results"`
+}
+
+type executedRunResponse struct {
+	JobID        string  `json:"job_id"`
+	RunID        string  `json:"run_id"`
+	ScheduledFor string  `json:"scheduled_for"`
+	Attempt      int     `json:"attempt"`
+	StartedAt    string  `json:"started_at"`
+	FinishedAt   string  `json:"finished_at"`
+	Outcome      string  `json:"outcome"`
+	Error        *string `json:"error"`
+}
+
+func registerRuns(router *gin.Engine, st *store.Store) {
+	router.POST("/api/v1/jobs/:id/runs", createRun(st))
+	router.POST("/api/v1/jobs/:id/runs/:run_id/retries", retryRun(st))
+	router.GET("/api/v1/jobs/:id/runs/:run_id", getRun(st))
+}
+
+func createRun(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		jobID := c.Param("id")
+		if exists, err := st.JobExists(jobID); err != nil {
+			writeJobError(c, errStorageUnavailable)
+			return
+		} else if !exists {
+			writeJobError(c, errJobNotFound)
+			return
+		}
+
+		var request createRunRequest
+		if !decodeJobBody(c, &request) {
+			return
+		}
+		if request.ScheduledFor == nil {
+			writeJobError(c, errRunTimeInvalid)
+			return
+		}
+		scheduledFor, startedAt, finishedAt, ok := parseRunWindow(c, *request.ScheduledFor, request.StartedAt, request.FinishedAt)
+		if !ok {
+			return
+		}
+		outcome, failure, ok := validateOutcome(c, request.Outcome, request.Error)
+		if !ok {
+			return
+		}
+
+		attempt := &store.Attempt{
+			JobID:        jobID,
+			RunID:        newID(),
+			Attempt:      1,
+			ScheduledFor: scheduledFor,
+			StartedAt:    startedAt,
+			FinishedAt:   finishedAt,
+			Outcome:      outcome,
+			Error:        failure,
+		}
+		if err := st.CreateRun(attempt); err != nil {
+			writeJobError(c, errStorageUnavailable)
+			return
+		}
+		c.JSON(http.StatusCreated, toRunResponse(&store.Run{
+			JobID:        attempt.JobID,
+			RunID:        attempt.RunID,
+			ScheduledFor: attempt.ScheduledFor,
+			Attempts:     []*store.Attempt{attempt},
+		}))
+	}
+}
+
+func retryRun(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		jobID := c.Param("id")
+		runID := c.Param("run_id")
+		if exists, err := st.JobExists(jobID); err != nil {
+			writeJobError(c, errStorageUnavailable)
+			return
+		} else if !exists {
+			writeJobError(c, errJobNotFound)
+			return
+		}
+
+		var request retryRunRequest
+		if !decodeJobBody(c, &request) {
+			return
+		}
+
+		run, err := st.GetRun(jobID, runID)
+		if err != nil {
+			writeRunLookupError(c, err)
+			return
+		}
+		latest := run.Attempts[len(run.Attempts)-1]
+		if latest.Outcome != "failed" {
+			writeJobError(c, errRetryNotAllowed)
+			return
+		}
+
+		startedAt, finishedAt, ok := parseRunTimes(c, latest.ScheduledFor, request.StartedAt, request.FinishedAt)
+		if !ok {
+			return
+		}
+		outcome, failure, ok := validateOutcome(c, request.Outcome, request.Error)
+		if !ok {
+			return
+		}
+
+		if _, err := st.AppendRetry(jobID, runID, startedAt, finishedAt, outcome, failure); err != nil {
+			writeRunWriteError(c, err)
+			return
+		}
+
+		fresh, err := st.GetRun(jobID, runID)
+		if err != nil {
+			writeRunLookupError(c, err)
+			return
+		}
+		c.JSON(http.StatusCreated, toRunResponse(fresh))
+	}
+}
+
+func getRun(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		run, err := st.GetRun(c.Param("id"), c.Param("run_id"))
+		if err != nil {
+			writeRunLookupError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, toRunResponse(run))
+	}
+}
+
+func parseRunWindow(c *gin.Context, scheduledText, startedText, finishedText string) (time.Time, time.Time, time.Time, bool) {
+	scheduledFor, err := time.Parse(time.RFC3339, scheduledText)
+	if err != nil {
+		writeJobError(c, errRunTimeInvalid)
+		return time.Time{}, time.Time{}, time.Time{}, false
+	}
+	startedAt, finishedAt, ok := parseRunTimes(c, scheduledFor, startedText, finishedText)
+	return scheduledFor.UTC(), startedAt, finishedAt, ok
+}
+
+func parseRunTimes(c *gin.Context, scheduledFor time.Time, startedText, finishedText string) (time.Time, time.Time, bool) {
+	startedAt, err := time.Parse(time.RFC3339, startedText)
+	if err != nil {
+		writeJobError(c, errRunTimeInvalid)
+		return time.Time{}, time.Time{}, false
+	}
+	finishedAt, err := time.Parse(time.RFC3339, finishedText)
+	if err != nil {
+		writeJobError(c, errRunTimeInvalid)
+		return time.Time{}, time.Time{}, false
+	}
+	startedAt = startedAt.UTC()
+	finishedAt = finishedAt.UTC()
+	scheduledFor = scheduledFor.UTC()
+	if startedAt.Before(scheduledFor) || finishedAt.Before(startedAt) {
+		writeJobError(c, errRunTimeInvalid)
+		return time.Time{}, time.Time{}, false
+	}
+	return startedAt, finishedAt, true
+}
+
+func validateOutcome(c *gin.Context, outcome string, failure *string) (string, *string, bool) {
+	if outcome != "succeeded" && outcome != "failed" {
+		writeJobError(c, errRunOutcomeInvalid)
+		return "", nil, false
+	}
+	switch {
+	case outcome == "succeeded":
+		if failure != nil {
+			writeJobError(c, errRunOutcomeInvalid)
+			return "", nil, false
+		}
+		return outcome, nil, true
+	default:
+		if failure == nil || strings.TrimSpace(*failure) == "" {
+			writeJobError(c, errRunOutcomeInvalid)
+			return "", nil, false
+		}
+		return outcome, failure, true
+	}
+}
+
+func toRunResponse(run *store.Run) runResponse {
+	results := make([]attemptResponse, 0, len(run.Attempts))
+	for _, attempt := range run.Attempts {
+		results = append(results, attemptResponse{
+			Attempt:    attempt.Attempt,
+			StartedAt:  formatTime(attempt.StartedAt),
+			FinishedAt: formatTime(attempt.FinishedAt),
+			Outcome:    attempt.Outcome,
+			Error:      attempt.Error,
+		})
+	}
+	return runResponse{
+		RunID:        run.RunID,
+		JobID:        run.JobID,
+		ScheduledFor: formatTime(run.ScheduledFor),
+		Results:      results,
+	}
+}
+
+func writeRunLookupError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeJobError(c, errJobNotFound)
+	case errors.Is(err, store.ErrRunNotFound):
+		writeJobError(c, errRunNotFound)
+	default:
+		writeJobError(c, errStorageUnavailable)
+	}
+}
+
+func writeRunWriteError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeJobError(c, errJobNotFound)
+	case errors.Is(err, store.ErrRunNotFound):
+		writeJobError(c, errRunNotFound)
+	case errors.Is(err, store.ErrRetryNotAllowed):
+		writeJobError(c, errRetryNotAllowed)
+	default:
+		writeJobError(c, errStorageUnavailable)
+	}
+}
