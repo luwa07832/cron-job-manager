@@ -55,6 +55,7 @@ type executedRunResponse struct {
 func registerRuns(router *gin.Engine, st *store.Store) {
 	router.POST("/api/v1/jobs/:id/runs", createRun(st))
 	router.POST("/api/v1/jobs/:id/runs/:run_id/retries", retryRun(st))
+	router.GET("/api/v1/jobs/:id/runs", listJobRuns(st))
 	router.GET("/api/v1/jobs/:id/runs/:run_id", getRun(st))
 }
 
@@ -168,6 +169,25 @@ func getRun(st *store.Store) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, toRunResponse(run))
+	}
+}
+
+func listJobRuns(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		from, to, ok := parseTimeWindow(c)
+		if !ok {
+			return
+		}
+		runs, err := st.RunsForJob(c.Param("id"), from, to)
+		if err != nil {
+			writeRunLookupError(c, err)
+			return
+		}
+		responses := make([]runResponse, 0, len(runs))
+		for _, run := range runs {
+			responses = append(responses, toRunResponse(run))
+		}
+		c.JSON(http.StatusOK, responses)
 	}
 }
 

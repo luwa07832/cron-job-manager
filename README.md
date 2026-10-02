@@ -151,6 +151,26 @@ go run .
 }
 ```
 
+### `GET /api/v1/jobs/{id}/runs?from=...&to=...`
+
+按任务查看完整运行链。`from`、`to` 为必填的 RFC3339 时间戳，返回 `scheduled_for` 落入窗口 `[from, to)` 的运行，按 `scheduled_for`、`run_id` 升序；每个数组元素的结构与单次执行查询相同，`results` 按 `attempt` 升序：
+
+```json
+[
+  {
+    "run_id": "3f1c...",
+    "job_id": "9d2e...",
+    "scheduled_for": "2026-10-02T01:30:00Z",
+    "results": [
+      {"attempt": 1, "started_at": "...", "finished_at": "...", "outcome": "failed", "error": "exit status 1"},
+      {"attempt": 2, "started_at": "...", "finished_at": "...", "outcome": "succeeded", "error": null}
+    ]
+  }
+]
+```
+
+窗口校验与 `GET /api/v1/jobs` 的窗口查询一致；`id` 不对应任何任务时返回 404 `job_not_found`，已软删除任务的历史仍可查询。无匹配运行时返回 HTTP 200 与空数组 `[]`。本入口只读取既有登记，不启动任务，也不改写历史。
+
 ### `GET /api/v1/jobs?state=executed&from=...&to=...`
 
 按 `scheduled_for` 查询窗口 `[from, to)` 内已登记的执行结果；每个重试结果各占一行，包含软删除任务的历史。返回按 `scheduled_for`、`job_id`、`run_id`、`attempt` 升序：

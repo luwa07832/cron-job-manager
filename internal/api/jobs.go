@@ -212,29 +212,13 @@ func listPendingJobs(st *store.Store) gin.HandlerFunc {
 			writeJobError(c, errTimeWindowInvalid)
 			return
 		}
-		fromText, hasFrom := c.GetQuery("from")
-		toText, hasTo := c.GetQuery("to")
-		if !hasFrom || !hasTo {
-			writeJobError(c, errTimeWindowRequired)
-			return
-		}
-		from, err := time.Parse(time.RFC3339, fromText)
-		if err != nil {
-			writeJobError(c, errTimeWindowInvalid)
-			return
-		}
-		to, err := time.Parse(time.RFC3339, toText)
-		if err != nil {
-			writeJobError(c, errTimeWindowInvalid)
-			return
-		}
-		if !from.Before(to) {
-			writeJobError(c, errTimeWindowInvalid)
+		from, to, ok := parseTimeWindow(c)
+		if !ok {
 			return
 		}
 
 		if state == "executed" {
-			attempts, err := st.ExecutedAttempts(from.UTC(), to.UTC())
+			attempts, err := st.ExecutedAttempts(from, to)
 			if err != nil {
 				writeJobError(c, errStorageUnavailable)
 				return
@@ -256,7 +240,7 @@ func listPendingJobs(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		jobs, err := st.PendingJobs(from.UTC(), to.UTC())
+		jobs, err := st.PendingJobs(from, to)
 		if err != nil {
 			writeJobError(c, errStorageUnavailable)
 			return
@@ -267,6 +251,33 @@ func listPendingJobs(st *store.Store) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, responses)
 	}
+}
+
+// parseTimeWindow validates the shared from/to query contract: both
+// parameters are required RFC3339 timestamps and from must precede to. The
+// returned instants are normalized to UTC.
+func parseTimeWindow(c *gin.Context) (time.Time, time.Time, bool) {
+	fromText, hasFrom := c.GetQuery("from")
+	toText, hasTo := c.GetQuery("to")
+	if !hasFrom || !hasTo {
+		writeJobError(c, errTimeWindowRequired)
+		return time.Time{}, time.Time{}, false
+	}
+	from, err := time.Parse(time.RFC3339, fromText)
+	if err != nil {
+		writeJobError(c, errTimeWindowInvalid)
+		return time.Time{}, time.Time{}, false
+	}
+	to, err := time.Parse(time.RFC3339, toText)
+	if err != nil {
+		writeJobError(c, errTimeWindowInvalid)
+		return time.Time{}, time.Time{}, false
+	}
+	if !from.Before(to) {
+		writeJobError(c, errTimeWindowInvalid)
+		return time.Time{}, time.Time{}, false
+	}
+	return from.UTC(), to.UTC(), true
 }
 
 func decodeJobBody(c *gin.Context, target any) bool {
