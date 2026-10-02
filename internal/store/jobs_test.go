@@ -125,6 +125,125 @@ func TestUpdateMissingJob(t *testing.T) {
 	}
 }
 
+func TestAdvanceNextRunMovesCursor(t *testing.T) {
+	st := newTestStore(t)
+	cursor := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	if _, err := st.CreateJob(sampleJob("a", "hourly", true, &cursor)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	following := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	advancedAt := time.Date(2026, 10, 2, 11, 0, 0, 0, time.UTC)
+	if err := st.AdvanceNextRun("a", cursor, &following, advancedAt); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	got, err := st.GetJob("a")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.NextRun == nil || !got.NextRun.Equal(following) {
+		t.Fatalf("next_run = %v, want %s", got.NextRun, following)
+	}
+	if !got.UpdatedAt.Equal(advancedAt) {
+		t.Fatalf("updated_at = %s, want %s", got.UpdatedAt, advancedAt)
+	}
+}
+
+func TestAdvanceNextRunClearsCursor(t *testing.T) {
+	st := newTestStore(t)
+	cursor := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	if _, err := st.CreateJob(sampleJob("a", "hourly", true, &cursor)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.AdvanceNextRun("a", cursor, nil, time.Now().UTC()); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	got, _ := st.GetJob("a")
+	if got.NextRun != nil {
+		t.Fatalf("next_run = %v, want nil", got.NextRun)
+	}
+}
+
+func TestAdvanceNextRunRejectsStaleCursor(t *testing.T) {
+	st := newTestStore(t)
+	cursor := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	if _, err := st.CreateJob(sampleJob("a", "hourly", true, &cursor)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	following := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+	if err := st.AdvanceNextRun("a", cursor, &following, time.Now().UTC()); err != nil {
+		t.Fatalf("first advance: %v", err)
+	}
+
+	later := time.Date(2026, 10, 2, 11, 0, 0, 0, time.UTC)
+	if err := st.AdvanceNextRun("a", cursor, &later, time.Now().UTC()); !errors.Is(err, ErrNextRunConflict) {
+		t.Fatalf("err = %v, want ErrNextRunConflict", err)
+	}
+	got, _ := st.GetJob("a")
+	if got.NextRun == nil || !got.NextRun.Equal(following) {
+		t.Fatalf("next_run = %v, want untouched %s", got.NextRun, following)
+	}
+}
+
+func TestAdvanceNextRunMissingDisabledDeleted(t *testing.T) {
+	st := newTestStore(t)
+	cursor := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	following := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+
+	if err := st.AdvanceNextRun("ghost", cursor, &following, time.Now().UTC()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing err = %v, want ErrNotFound", err)
+	}
+
+	if _, err := st.CreateJob(sampleJob("off", "off", false, nil)); err != nil {
+		t.Fatalf("create disabled: %v", err)
+	}
+	if err := st.AdvanceNextRun("off", cursor, &following, time.Now().UTC()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled err = %v, want ErrNotFound", err)
+	}
+
+	if _, err := st.CreateJob(sampleJob("gone", "gone", true, &cursor)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.DeleteJob("gone", time.Now().UTC()); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := st.AdvanceNextRun("gone", cursor, &following, time.Now().UTC()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestAdvanceNextRunConcurrentClaimants(t *testing.T) {
+	st := newTestStore(t)
+	cursor := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	if _, err := st.CreateJob(sampleJob("a", "hourly", true, &cursor)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	const claimants = 8
+	results := make(chan error, claimants)
+	for i := 0; i < claimants; i++ {
+		go func() {
+			following := cursor.Add(time.Hour)
+			results <- st.AdvanceNextRun("a", cursor, &following, time.Now().UTC())
+		}()
+	}
+	var succeeded, conflicts int
+	for i := 0; i < claimants; i++ {
+		switch err := <-results; {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrNextRunConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected err = %v", err)
+		}
+	}
+	if succeeded != 1 || conflicts != claimants-1 {
+		t.Fatalf("succeeded = %d, conflicts = %d, want 1 and %d", succeeded, conflicts, claimants-1)
+	}
+}
+
 func TestPendingJobsWindowAndOrder(t *testing.T) {
 	st := newTestStore(t)
 	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)

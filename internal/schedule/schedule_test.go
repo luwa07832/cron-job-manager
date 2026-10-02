@@ -179,3 +179,90 @@ func TestLeapDayScheduleFires(t *testing.T) {
 		t.Fatalf("Next = %s, want %s", got, want)
 	}
 }
+
+func TestThroughEnumeratesClosedInterval(t *testing.T) {
+	spec, err := Parse("*/15 9-10 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := atUTC(2026, time.October, 2, 9, 0)
+	to := atUTC(2026, time.October, 2, 10, 0)
+	matches, following := spec.Through(from, to, time.UTC)
+
+	want := []time.Time{
+		atUTC(2026, time.October, 2, 9, 0),
+		atUTC(2026, time.October, 2, 9, 15),
+		atUTC(2026, time.October, 2, 9, 30),
+		atUTC(2026, time.October, 2, 9, 45),
+		atUTC(2026, time.October, 2, 10, 0),
+	}
+	if len(matches) != len(want) {
+		t.Fatalf("Through returned %d matches %v, want %d", len(matches), matches, len(want))
+	}
+	for i, instant := range want {
+		if !matches[i].Equal(instant) {
+			t.Fatalf("matches[%d] = %s, want %s", i, matches[i], instant)
+		}
+		if matches[i].Location() != time.UTC {
+			t.Fatalf("matches[%d] location = %s, want UTC", i, matches[i].Location())
+		}
+	}
+	if want := atUTC(2026, time.October, 2, 10, 15); !following.Equal(want) {
+		t.Fatalf("following = %s, want %s", following, want)
+	}
+}
+
+func TestThroughSingleMatchWhenToEqualsFrom(t *testing.T) {
+	spec, err := Parse("30 10 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := atUTC(2026, time.October, 2, 10, 30)
+	matches, following := spec.Through(from, from, time.UTC)
+	if len(matches) != 1 || !matches[0].Equal(from) {
+		t.Fatalf("matches = %v, want [%s]", matches, from)
+	}
+	if want := atUTC(2026, time.October, 3, 10, 30); !following.Equal(want) {
+		t.Fatalf("following = %s, want %s", following, want)
+	}
+}
+
+func TestThroughHonorsTimezone(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := Parse("30 9 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 09:30 Shanghai is 01:30 UTC; the window covers two local mornings.
+	from := atUTC(2026, time.October, 2, 1, 30)
+	to := atUTC(2026, time.October, 3, 1, 30)
+	matches, following := spec.Through(from, to, loc)
+	if len(matches) != 2 {
+		t.Fatalf("matches = %v, want 2 entries", matches)
+	}
+	if !matches[0].Equal(from) || !matches[1].Equal(to) {
+		t.Fatalf("matches = %v, want [%s %s]", matches, from, to)
+	}
+	if want := atUTC(2026, time.October, 4, 1, 30); !following.Equal(want) {
+		t.Fatalf("following = %s, want %s", following, want)
+	}
+}
+
+func TestThroughRejectsInvertedWindow(t *testing.T) {
+	spec, err := Parse("0 9 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := atUTC(2026, time.October, 3, 9, 0)
+	to := atUTC(2026, time.October, 2, 9, 0)
+	matches, following := spec.Through(from, to, time.UTC)
+	if len(matches) != 0 {
+		t.Fatalf("matches = %v, want none", matches)
+	}
+	if want := atUTC(2026, time.October, 3, 9, 0); !following.Equal(want) {
+		t.Fatalf("following = %s, want %s", following, want)
+	}
+}

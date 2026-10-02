@@ -403,6 +403,18 @@ var (
 		status: http.StatusConflict, code: "retry_not_allowed",
 		message: "only the latest result of a failed run can be retried",
 	}
+	errDispatchTimeInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "dispatch_time_invalid",
+		message: "expected_next_run and before must be RFC3339 timestamps",
+	}
+	errNextRunConflict = &jobError{
+		status: http.StatusConflict, code: "next_run_conflict",
+		message: "expected_next_run does not match the current next_run",
+	}
+	errDispatchNotDue = &jobError{
+		status: http.StatusConflict, code: "dispatch_not_due",
+		message: "the current next_run is later than before",
+	}
 	errRunTimeInvalid = &jobError{
 		status: http.StatusUnprocessableEntity, code: "run_time_invalid",
 		message: "started_at must not precede scheduled_for and finished_at must not precede started_at",

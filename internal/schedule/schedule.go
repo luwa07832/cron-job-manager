@@ -192,6 +192,28 @@ func (s Spec) Next(from time.Time, loc *time.Location) time.Time {
 	return time.Time{}
 }
 
+// Through returns every instant matching the expression in the closed
+// interval [from, to], computed in loc and returned in UTC ascending order,
+// together with the first matching instant strictly after to. The follow-up
+// instant is the zero time when no match exists within the search horizon.
+// from must itself be a matching instant, which holds for every stored
+// schedule cursor.
+func (s Spec) Through(from, to time.Time, loc *time.Location) ([]time.Time, time.Time) {
+	if from.After(to) {
+		return nil, s.Next(to, loc)
+	}
+	matches := []time.Time{from.UTC()}
+	cursor := from
+	for {
+		next := s.Next(cursor, loc)
+		if next.IsZero() || next.After(to) {
+			return matches, next
+		}
+		matches = append(matches, next.UTC())
+		cursor = next
+	}
+}
+
 // dayMatches applies standard cron semantics: when both day-of-month and
 // day-of-week are restricted they are ORed together; "*" on either side means
 // the other field alone decides.

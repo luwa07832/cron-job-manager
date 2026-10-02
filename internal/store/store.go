@@ -16,6 +16,10 @@ var ErrNotFound = errors.New("store: job not found")
 // ErrNameConflict reports that an active job already uses the name.
 var ErrNameConflict = errors.New("store: job name already in use")
 
+// ErrNextRunConflict reports that the stored scheduling cursor no longer
+// matches the value the caller read, so the advance was refused.
+var ErrNextRunConflict = errors.New("store: next_run no longer matches")
+
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
 	db *sql.DB
@@ -48,6 +52,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// SQLite admits a single writer; one connection serializes every
+	// statement so concurrent writes queue instead of failing with
+	// SQLITE_BUSY, which keeps compare-and-swap updates race-safe.
+	db.SetMaxOpenConns(1)
 	return &Store{db: db}, nil
 }
 
@@ -131,6 +139,47 @@ func (s *Store) DeleteJob(id string, deletedAt time.Time) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// AdvanceNextRun atomically moves the scheduling cursor of an enabled,
+// active job from expected to next, bumping updated_at. It returns
+// ErrNotFound when the job is missing, deleted or disabled and
+// ErrNextRunConflict when another writer moved the cursor first.
+func (s *Store) AdvanceNextRun(id string, expected time.Time, next *time.Time, updatedAt time.Time) error {
+	var nextNS any
+	if next != nil {
+		nextNS = next.UnixNano()
+	}
+	result, err := s.db.Exec(
+		`UPDATE jobs
+		    SET next_run = ?, updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL AND enabled = 1 AND next_run = ?`,
+		nextNS, updatedAt.UnixNano(), id, expected.UnixNano(),
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		return nil
+	}
+	var enabled int
+	err = s.db.QueryRow(
+		`SELECT enabled FROM jobs WHERE id = ? AND deleted_at IS NULL`, id,
+	).Scan(&enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if enabled != 1 {
+		return ErrNotFound
+	}
+	return ErrNextRunConflict
 }
 
 // PendingJobs returns enabled, active jobs whose next firing instant falls in
