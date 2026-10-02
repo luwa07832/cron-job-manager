@@ -4,6 +4,7 @@ package main
 import (
 	"log"
 	"os"
+	_ "time/tzdata"
 
 	"github.com/luwa07832/cron-job-manager/internal/api"
 	"github.com/luwa07832/cron-job-manager/internal/store"
