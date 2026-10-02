@@ -399,6 +399,18 @@ var (
 		status: http.StatusNotFound, code: "run_not_found",
 		message: "the requested run does not exist",
 	}
+	errNextRunConflict = &jobError{
+		status: http.StatusConflict, code: "next_run_conflict",
+		message: "expected_next_run does not match the current next_run",
+	}
+	errDispatchNotDue = &jobError{
+		status: http.StatusConflict, code: "dispatch_not_due",
+		message: "the current next_run is later than before",
+	}
+	errDispatchTimeInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "dispatch_time_invalid",
+		message: "expected_next_run and before must be RFC3339 timestamps",
+	}
 	errRetryNotAllowed = &jobError{
 		status: http.StatusConflict, code: "retry_not_allowed",
 		message: "only the latest result of a failed run can be retried",

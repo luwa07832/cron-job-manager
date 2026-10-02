@@ -103,6 +103,32 @@ go run .
 
 无匹配时返回 HTTP 200 与空数组 `[]`。
 
+### `POST /api/v1/jobs/{id}/dispatches`
+
+批量领取已到期的触发时刻并推进调度游标。该入口只管理调度状态：不启动任何外部命令，也不会创建 `runs` 或 `run_attempts`。请求体是包含两个 UTC RFC3339 时间戳（均允许携带偏移量）的单个 JSON 对象：
+
+```json
+{
+  "expected_next_run": "2026-10-02T14:00:00Z",
+  "before": "2026-10-02T16:00:00Z"
+}
+```
+
+- `expected_next_run`：调用方看到的当前 `next_run`，必须与调用前任务存储的游标表示同一时刻。
+- `before`：本次领取的截止时刻。
+
+服务在同一原子操作中枚举任务表达式从原 `next_run` 到 `before` 闭区间 `[next_run, before]` 内的全部触发时刻，并把 `next_run` 更新为任务时区下严格晚于 `before` 的下一次匹配时刻。成功返回 HTTP 200，时间统一以 UTC RFC3339 表达：
+
+```json
+{
+  "job_id": "9a30...",
+  "occurrences": ["2026-10-02T14:00:00Z", "2026-10-02T15:00:00Z", "2026-10-02T16:00:00Z"],
+  "next_run": "2026-10-02T17:00:00Z"
+}
+```
+
+无论区间内有一个还是多个触发时刻都完整返回；`occurrences` 至少包含当前 `next_run`。只有启用且未删除的任务可以领取：停用、已删除或不存在时返回 404 `job_not_found`。并发请求竞争同一游标时，条件更新只允许与存储原值匹配的请求成功，其余请求得到 409 `next_run_conflict` 且不改变状态；当前 `next_run` 晚于 `before` 时返回 409 `dispatch_not_due`，同样不改状态。领取结果不登记为执行，历史查询与后续执行登记语义不受影响。
+
 ### `POST /api/v1/jobs/{id}/runs`
 
 为任务登记一次执行（只记录，不会启动任何外部命令）。`run_id` 由服务生成，首个结果的 `attempt` 为 `1`。请求体：
@@ -196,6 +222,9 @@ go run .
 | 404 | `route_not_found` | 请求未匹配任何路由 |
 | 404 | `run_not_found` | 读取或重试的执行不存在 |
 | 409 | `retry_not_allowed` | 执行最新结果不是 `failed`，不能追加重试 |
+| 409 | `next_run_conflict` | 领取时 `expected_next_run` 与任务当前 `next_run` 不一致（游标已被他人推进） |
+| 409 | `dispatch_not_due` | 领取时任务当前 `next_run` 晚于 `before`，尚无到期触发 |
+| 422 | `dispatch_time_invalid` | 领取请求缺少 `expected_next_run` 或 `before`，或时间戳格式非法 |
 | 422 | `run_time_invalid` | 执行时间缺失或不满足先后关系 |
 | 422 | `run_outcome_invalid` | `outcome` 不合法，或 `error` 与成败状态不一致 |
 | 422 | `name_required` | 名称为空或仅空白 |
