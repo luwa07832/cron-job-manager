@@ -188,6 +188,53 @@ func (s *Store) ExecutedAttempts(from, to time.Time) ([]*Attempt, error) {
 	return attempts, nil
 }
 
+// RunsForJob returns every run of one job whose scheduled instant falls in
+// [from, to), ordered by scheduled instant and run identifier, each carrying
+// its attempts in ascending order. It returns ErrNotFound when no job ever
+// used the id; history of soft-deleted jobs remains readable.
+func (s *Store) RunsForJob(jobID string, from, to time.Time) ([]*Run, error) {
+	var jobExists int
+	err := s.db.QueryRow(`SELECT 1 FROM jobs WHERE id = ?`, jobID).Scan(&jobExists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(
+		`SELECT job_id, run_id, attempt, scheduled_for, started_at, finished_at, outcome, error
+		   FROM run_attempts
+		  WHERE job_id = ? AND scheduled_for >= ? AND scheduled_for < ?
+		  ORDER BY scheduled_for ASC, run_id ASC, attempt ASC`,
+		jobID, from.UnixNano(), to.UnixNano(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var runs []*Run
+	for rows.Next() {
+		attempt, err := scanAttempt(rows)
+		if err != nil {
+			return nil, err
+		}
+		if len(runs) == 0 || runs[len(runs)-1].RunID != attempt.RunID {
+			runs = append(runs, &Run{
+				JobID:        attempt.JobID,
+				RunID:        attempt.RunID,
+				ScheduledFor: attempt.ScheduledFor,
+			})
+		}
+		runs[len(runs)-1].Attempts = append(runs[len(runs)-1].Attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return runs, nil
+}
+
 func scanRun(rows *sql.Rows) (*Run, error) {
 	var run *Run
 	for rows.Next() {

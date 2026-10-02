@@ -231,4 +231,96 @@ func TestDeletedJobHistoryStaysReadableAndActiveCheck(t *testing.T) {
 	}
 }
 
+func TestRunsForJobWindowGroupingAndDeletedJobs(t *testing.T) {
+	st := newTestStore(t)
+	createJobForRun(t, st, "a")
+	createJobForRun(t, st, "b")
+	createJobForRun(t, st, "gone")
+
+	at := func(day, hour int) time.Time {
+		return time.Date(2026, 10, day, hour, 0, 0, 0, time.UTC)
+	}
+	failure := "x"
+	mustRun := func(jobID, runID string, scheduled time.Time, outcome string) {
+		t.Helper()
+		var errText *string
+		if outcome == "failed" {
+			errText = &failure
+		}
+		if err := st.CreateRun(&Attempt{
+			JobID: jobID, RunID: runID, ScheduledFor: scheduled,
+			StartedAt: scheduled, FinishedAt: scheduled.Add(time.Minute),
+			Outcome: outcome, Error: errText,
+		}); err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+	}
+	mustRun("a", "r-a2", at(2, 9), "failed")
+	mustRun("a", "r-a1", at(2, 9), "succeeded")
+	mustRun("a", "r-a3", at(3, 8), "succeeded")
+	mustRun("b", "r-b1", at(2, 9), "succeeded")
+	mustRun("gone", "r-g1", at(2, 10), "succeeded")
+	if _, err := st.AppendRetry("a", "r-a2", at(2, 10), at(2, 11), "succeeded", nil); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if err := st.DeleteJob("gone", time.Now()); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	from := at(2, 0)
+	to := at(3, 0)
+	runs, err := st.RunsForJob("a", from, to)
+	if err != nil {
+		t.Fatalf("runs for job: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(runs), runs)
+	}
+	// Same scheduled_for ties break on run_id; attempts stay grouped ascending.
+	if runs[0].RunID != "r-a1" || runs[1].RunID != "r-a2" {
+		t.Fatalf("order = %s, %s", runs[0].RunID, runs[1].RunID)
+	}
+	if len(runs[0].Attempts) != 1 || runs[0].Attempts[0].Attempt != 1 {
+		t.Fatalf("r-a1 attempts = %+v", runs[0].Attempts)
+	}
+	if len(runs[1].Attempts) != 2 || runs[1].Attempts[0].Attempt != 1 || runs[1].Attempts[1].Attempt != 2 {
+		t.Fatalf("r-a2 attempts = %+v", runs[1].Attempts)
+	}
+	for _, run := range runs {
+		if run.JobID != "a" {
+			t.Fatalf("foreign job leaked: %+v", run)
+		}
+	}
+
+	// The window is half-open: a run scheduled exactly at to is excluded.
+	runs, err = st.RunsForJob("a", from, at(3, 8))
+	if err != nil {
+		t.Fatalf("runs for job: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("half-open len = %d, want 2", len(runs))
+	}
+
+	// Soft-deleted jobs keep their history readable.
+	runs, err = st.RunsForJob("gone", from, to)
+	if err != nil {
+		t.Fatalf("deleted job history: %v", err)
+	}
+	if len(runs) != 1 || runs[0].RunID != "r-g1" {
+		t.Fatalf("deleted job runs = %+v", runs)
+	}
+
+	// Unknown jobs and empty windows behave like the other lookups.
+	if _, err := st.RunsForJob("ghost", from, to); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ghost err = %v, want ErrNotFound", err)
+	}
+	runs, err = st.RunsForJob("a", at(5, 0), at(6, 0))
+	if err != nil {
+		t.Fatalf("empty window: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("empty window = %+v", runs)
+	}
+}
+
 func strp(value string) *string { return &value }

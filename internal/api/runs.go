@@ -55,6 +55,7 @@ type executedRunResponse struct {
 func registerRuns(router *gin.Engine, st *store.Store) {
 	router.POST("/api/v1/jobs/:id/runs", createRun(st))
 	router.POST("/api/v1/jobs/:id/runs/:run_id/retries", retryRun(st))
+	router.GET("/api/v1/jobs/:id/runs", listRuns(st))
 	router.GET("/api/v1/jobs/:id/runs/:run_id", getRun(st))
 }
 
@@ -168,6 +169,42 @@ func getRun(st *store.Store) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, toRunResponse(run))
+	}
+}
+
+func listRuns(st *store.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		fromText, hasFrom := c.GetQuery("from")
+		toText, hasTo := c.GetQuery("to")
+		if !hasFrom || !hasTo {
+			writeJobError(c, errTimeWindowRequired)
+			return
+		}
+		from, err := time.Parse(time.RFC3339, fromText)
+		if err != nil {
+			writeJobError(c, errTimeWindowInvalid)
+			return
+		}
+		to, err := time.Parse(time.RFC3339, toText)
+		if err != nil {
+			writeJobError(c, errTimeWindowInvalid)
+			return
+		}
+		if !from.Before(to) {
+			writeJobError(c, errTimeWindowInvalid)
+			return
+		}
+
+		runs, err := st.RunsForJob(c.Param("id"), from.UTC(), to.UTC())
+		if err != nil {
+			writeRunLookupError(c, err)
+			return
+		}
+		responses := make([]runResponse, 0, len(runs))
+		for _, run := range runs {
+			responses = append(responses, toRunResponse(run))
+		}
+		c.JSON(http.StatusOK, responses)
 	}
 }
 

@@ -376,3 +376,130 @@ func TestListExecutedValidation(t *testing.T) {
 		t.Fatalf("default pending = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestListRunsForJob(t *testing.T) {
+	f := newAPIFixture(t)
+	jobA := createTestJob(t, f, "chain-a")
+	jobB := createTestJob(t, f, "chain-b")
+
+	create := func(jobID, scheduled, outcome string, errText any) string {
+		t.Helper()
+		recorder := f.request(http.MethodPost, "/api/v1/jobs/"+jobID+"/runs",
+			runInput(scheduled, scheduled, scheduled, outcome, errText))
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("create run = %d %s", recorder.Code, recorder.Body.String())
+		}
+		return decodeBody(t, recorder)["run_id"].(string)
+	}
+
+	failedRun := create(jobA, "2026-10-02T01:30:00Z", "failed", "exit status 1")
+	create(jobA, "2026-10-03T01:30:00Z", "succeeded", nil)
+	// A sibling job with runs in the same window must not leak into job A.
+	create(jobB, "2026-10-02T01:30:00Z", "succeeded", nil)
+
+	retried := f.request(http.MethodPost, "/api/v1/jobs/"+jobA+"/runs/"+failedRun+"/retries",
+		retryInput("2026-10-02T02:30:00Z", "2026-10-02T02:31:00Z", "succeeded", nil))
+	if retried.Code != http.StatusCreated {
+		t.Fatalf("retry = %d %s", retried.Code, retried.Body.String())
+	}
+
+	target := "/api/v1/jobs/" + jobA + "/runs?from=2026-10-02T00:00:00Z&to=2026-10-04T00:00:00Z"
+	recorder := f.request(http.MethodGet, target, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d %s", recorder.Code, recorder.Body.String())
+	}
+	var runs []map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("len = %d, want 2: %s", len(runs), recorder.Body.String())
+	}
+	first, second := runs[0], runs[1]
+	if first["run_id"] != failedRun || first["job_id"] != jobA ||
+		first["scheduled_for"] != "2026-10-02T01:30:00Z" {
+		t.Fatalf("first run = %s", recorder.Body.String())
+	}
+	if second["job_id"] != jobA || second["scheduled_for"] != "2026-10-03T01:30:00Z" {
+		t.Fatalf("second run = %s", recorder.Body.String())
+	}
+
+	// The retried run carries both attempts in ascending order.
+	results, _ := first["results"].([]any)
+	if len(results) != 2 {
+		t.Fatalf("results = %s", recorder.Body.String())
+	}
+	attempt1 := results[0].(map[string]any)
+	attempt2 := results[1].(map[string]any)
+	if attempt1["attempt"].(float64) != 1 || attempt1["outcome"] != "failed" ||
+		attempt1["error"] != "exit status 1" {
+		t.Fatalf("attempt 1 = %s", recorder.Body.String())
+	}
+	if attempt2["attempt"].(float64) != 2 || attempt2["outcome"] != "succeeded" ||
+		attempt2["error"] != nil {
+		t.Fatalf("attempt 2 = %s", recorder.Body.String())
+	}
+	for _, field := range []string{"started_at", "finished_at"} {
+		if _, ok := attempt1[field].(string); !ok {
+			t.Fatalf("attempt 1 missing %s: %s", field, recorder.Body.String())
+		}
+	}
+
+	// The window is half-open on the right.
+	target = "/api/v1/jobs/" + jobA + "/runs?from=2026-10-02T00:00:00Z&to=2026-10-03T01:30:00Z"
+	recorder = f.request(http.MethodGet, target, nil)
+	if err := json.Unmarshal(recorder.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(runs) != 1 || runs[0]["run_id"] != failedRun {
+		t.Fatalf("half-open = %s", recorder.Body.String())
+	}
+
+	// No matching runs yields an empty array, not null.
+	empty := f.request(http.MethodGet,
+		"/api/v1/jobs/"+jobA+"/runs?from=2030-01-01T00:00:00Z&to=2030-01-02T00:00:00Z", nil)
+	if empty.Code != http.StatusOK || empty.Body.String() != "[]" {
+		t.Fatalf("empty = %d %s", empty.Code, empty.Body.String())
+	}
+
+	// Soft-deleted jobs keep their history readable through this entry too.
+	deleted := f.request(http.MethodDelete, "/api/v1/jobs/"+jobA, nil)
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d", deleted.Code)
+	}
+	recorder = f.request(http.MethodGet,
+		"/api/v1/jobs/"+jobA+"/runs?from=2026-10-02T00:00:00Z&to=2026-10-04T00:00:00Z", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("history after delete = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &runs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("history after delete = %s", recorder.Body.String())
+	}
+}
+
+func TestListRunsForJobValidation(t *testing.T) {
+	f := newAPIFixture(t)
+	jobID := createTestJob(t, f, "chain-validation")
+	from := "2026-10-02T00:00:00Z"
+	to := "2026-10-03T00:00:00Z"
+
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs?to="+to, nil),
+		http.StatusBadRequest, "time_window_required")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs?from="+from, nil),
+		http.StatusBadRequest, "time_window_required")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs", nil),
+		http.StatusBadRequest, "time_window_required")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs?from=x&to="+to, nil),
+		http.StatusBadRequest, "time_window_invalid")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs?from="+from+"&to=y", nil),
+		http.StatusBadRequest, "time_window_invalid")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs?from="+to+"&to="+from, nil),
+		http.StatusBadRequest, "time_window_invalid")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/"+jobID+"/runs?from="+from+"&to="+from, nil),
+		http.StatusBadRequest, "time_window_invalid")
+	expectError(t, f.request(http.MethodGet, "/api/v1/jobs/ghost/runs?from="+from+"&to="+to, nil),
+		http.StatusNotFound, "job_not_found")
+}
