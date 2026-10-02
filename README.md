@@ -90,7 +90,7 @@ go run .
 
 按时间窗口查询待触发任务。
 
-- `state`：当前仅支持 `pending`；省略时同样按待触发处理。
+- `state`：支持 `pending`（省略时同样按待触发处理）与 `executed`（已执行记录，见下文）。
 - `from`、`to`：必填的 RFC3339 时间戳，窗口左闭右开（`[from, to)`）。
 
 返回启用、未删除且 `next_run` 落入窗口的任务，按 `next_run` 升序：
@@ -103,6 +103,60 @@ go run .
 
 无匹配时返回 HTTP 200 与空数组 `[]`。
 
+### `POST /api/v1/jobs/{id}/runs`
+
+登记一次执行（不启动任何外部命令），`run_id` 由服务生成，首个结果的 `attempt` 为 1。请求体：
+
+```json
+{
+  "scheduled_for": "2026-10-01T09:00:00Z",
+  "started_at": "2026-10-01T09:00:00Z",
+  "finished_at": "2026-10-01T09:00:12Z",
+  "outcome": "failed",
+  "error": "exit status 2"
+}
+```
+
+- `scheduled_for`、`started_at`、`finished_at`：必填的 UTC RFC3339 时间戳（带偏移的 RFC3339 也接受，响应统一转成 UTC）。要求 `started_at` 不早于 `scheduled_for`、`finished_at` 不早于 `started_at`（相等允许）。
+- `outcome`：仅允许 `succeeded` 或 `failed`。
+- `error`：成功时省略或为 `null`；失败时必须是非空白字符串。
+
+成功返回 HTTP 201，载荷与 `GET /api/v1/jobs/{id}/runs/{run_id}` 相同。
+
+### `POST /api/v1/jobs/{id}/runs/{run_id}/retries`
+
+向已登记的执行追加一次重试，请求体同上但不需要 `scheduled_for`（沿用该执行首次登记的值；即使提交也忽略）。新结果的 `attempt` 在该执行内递增。仅当当前最新结果为 `failed` 时允许重试，否则返回 409 `retry_not_allowed`。成功返回 HTTP 201，载荷为追加后的整个执行。
+
+### `GET /api/v1/jobs/{id}/runs/{run_id}`
+
+返回单次执行，`attempts` 按 `attempt` 升序：
+
+```json
+{
+  "job_id": "3f1c...",
+  "run_id": "9b2e...",
+  "scheduled_for": "2026-10-01T09:00:00Z",
+  "attempts": [
+    {"job_id": "3f1c...", "run_id": "9b2e...", "attempt": 1,
+     "scheduled_for": "2026-10-01T09:00:00Z",
+     "started_at": "2026-10-01T09:00:00Z", "finished_at": "2026-10-01T09:00:12Z",
+     "outcome": "failed", "error": "exit status 2"},
+    {"job_id": "3f1c...", "run_id": "9b2e...", "attempt": 2,
+     "scheduled_for": "2026-10-01T09:00:00Z",
+     "started_at": "2026-10-01T09:05:00Z", "finished_at": "2026-10-01T09:05:10Z",
+     "outcome": "succeeded", "error": null}
+  ]
+}
+```
+
+### `GET /api/v1/jobs?state=executed&from=...&to=...`
+
+按 `scheduled_for` 查询窗口 `[from, to)` 内的已执行记录。`from`、`to` 必填且为 RFC3339，且 `from` 早于 `to`；窗口规则、缺参与格式错误与 pending 查询一致（`time_window_required`、`time_window_invalid`，未知 `state` 同样为 `time_window_invalid`）。
+
+返回扁平的结果数组，每个元素对应一次 attempt，包含 `job_id`、`run_id`、`attempt`、`scheduled_for`、`started_at`、`finished_at`、`outcome`、`error`，按 `scheduled_for`、`job_id`、`run_id`、`attempt` 升序。同一执行的多次结果保持成组。已软删除任务的历史记录仍会出现在结果中；无匹配时返回 `[]`。
+
+任务软删除后，`POST .../runs` 与 `POST .../retries` 均以 404 `job_not_found` 拒绝，但已有历史仍可通过上述 GET 接口查询。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。
@@ -113,7 +167,11 @@ go run .
 | 400 | `time_window_required` | 窗口查询缺少 `from` 或 `to` |
 | 400 | `time_window_invalid` | 时间戳格式错误、`from` 不早于 `to`，或 `state` 不支持 |
 | 404 | `job_not_found` | 读取、修改或删除的任务不存在或已删除 |
+| 404 | `run_not_found` | 任务存在但执行不存在 |
 | 404 | `route_not_found` | 请求未匹配任何路由 |
+| 409 | `retry_not_allowed` | 执行最新结果不是 `failed`，不能重试 |
+| 422 | `run_time_invalid` | 时间缺失/格式错误，或 `started_at`、`finished_at`、`scheduled_for` 顺序不合法 |
+| 422 | `run_outcome_invalid` | `outcome` 非法，或成功携带非空白 `error`、失败缺少非空白 `error` |
 | 422 | `name_required` | 名称为空或仅空白 |
 | 422 | `name_conflict` | 名称与其他未删除任务重复 |
 | 422 | `schedule_invalid` | cron 表达式语法非法或不存在可到达的触发时刻 |

@@ -43,7 +43,7 @@ type jobResponse struct {
 
 func registerJobs(router *gin.Engine, st *store.Store) {
 	router.POST("/api/v1/jobs", createJob(st))
-	router.GET("/api/v1/jobs", listPendingJobs(st))
+	router.GET("/api/v1/jobs", listJobs(st))
 	router.GET("/api/v1/jobs/:id", getJob(st))
 	router.PATCH("/api/v1/jobs/:id", patchJob(st))
 	router.DELETE("/api/v1/jobs/:id", deleteJob(st))
@@ -202,12 +202,19 @@ func deleteJob(st *store.Store) gin.HandlerFunc {
 	}
 }
 
-func listPendingJobs(st *store.Store) gin.HandlerFunc {
+func listJobs(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if state := c.Query("state"); state != "" && state != "pending" {
+		state := c.Query("state")
+		switch state {
+		case "", "pending":
+		case "executed":
+			listExecutedJobs(c, st)
+			return
+		default:
 			writeJobError(c, errTimeWindowInvalid)
 			return
 		}
+
 		fromText, hasFrom := c.GetQuery("from")
 		toText, hasTo := c.GetQuery("to")
 		if !hasFrom || !hasTo {
@@ -240,6 +247,49 @@ func listPendingJobs(st *store.Store) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, responses)
 	}
+}
+
+func listExecutedJobs(c *gin.Context, st *store.Store) {
+	fromText, hasFrom := c.GetQuery("from")
+	toText, hasTo := c.GetQuery("to")
+	if !hasFrom || !hasTo {
+		writeJobError(c, errTimeWindowRequired)
+		return
+	}
+	from, err := time.Parse(time.RFC3339, fromText)
+	if err != nil {
+		writeJobError(c, errTimeWindowInvalid)
+		return
+	}
+	to, err := time.Parse(time.RFC3339, toText)
+	if err != nil {
+		writeJobError(c, errTimeWindowInvalid)
+		return
+	}
+	if !from.Before(to) {
+		writeJobError(c, errTimeWindowInvalid)
+		return
+	}
+
+	attempts, err := st.ExecutedRuns(from.UTC(), to.UTC())
+	if err != nil {
+		writeJobError(c, errStorageUnavailable)
+		return
+	}
+	responses := make([]runAttemptResponse, 0, len(attempts))
+	for _, attempt := range attempts {
+		responses = append(responses, runAttemptResponse{
+			JobID:        attempt.JobID,
+			RunID:        attempt.RunID,
+			Attempt:      attempt.Attempt,
+			ScheduledFor: formatTime(attempt.ScheduledFor),
+			StartedAt:    formatTime(attempt.StartedAt),
+			FinishedAt:   formatTime(attempt.FinishedAt),
+			Outcome:      attempt.Outcome,
+			Error:        attempt.Error,
+		})
+	}
+	c.JSON(http.StatusOK, responses)
 }
 
 func decodeJobBody(c *gin.Context, target any) bool {
@@ -356,6 +406,22 @@ var (
 	errJobNotFound = &jobError{
 		status: http.StatusNotFound, code: "job_not_found",
 		message: "the requested job does not exist",
+	}
+	errRunNotFound = &jobError{
+		status: http.StatusNotFound, code: "run_not_found",
+		message: "the requested run does not exist",
+	}
+	errRetryNotAllowed = &jobError{
+		status: http.StatusConflict, code: "retry_not_allowed",
+		message: "only a run whose latest result failed can be retried",
+	}
+	errRunTimeInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "run_time_invalid",
+		message: "started_at must not precede scheduled_for and finished_at must not precede started_at",
+	}
+	errRunOutcomeInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "run_outcome_invalid",
+		message: "outcome must be succeeded or failed with error omitted on success and required on failure",
 	}
 	errStorageUnavailable = &jobError{
 		status: http.StatusServiceUnavailable, code: "storage_unavailable",

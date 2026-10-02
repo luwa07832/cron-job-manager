@@ -232,4 +232,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_name_key
 CREATE INDEX IF NOT EXISTS jobs_pending_idx
 	ON jobs (next_run)
 	WHERE deleted_at IS NULL AND enabled = 1 AND next_run IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS runs (
+	id            TEXT PRIMARY KEY,
+	job_id        TEXT NOT NULL REFERENCES jobs(id),
+	scheduled_for INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_attempts (
+	run_id      TEXT NOT NULL REFERENCES runs(id),
+	job_id      TEXT NOT NULL REFERENCES jobs(id),
+	attempt     INTEGER NOT NULL,
+	started_at  INTEGER NOT NULL,
+	finished_at INTEGER NOT NULL,
+	outcome     TEXT NOT NULL,
+	error       TEXT,
+	PRIMARY KEY (run_id, attempt)
+);
+
+CREATE INDEX IF NOT EXISTS runs_scheduled_idx
+	ON runs (scheduled_for);
+
+CREATE INDEX IF NOT EXISTS run_attempts_run_idx
+	ON run_attempts (run_id, attempt);
 `
