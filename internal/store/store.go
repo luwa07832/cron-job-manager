@@ -299,4 +299,14 @@ CREATE INDEX IF NOT EXISTS run_attempts_run_idx
 
 CREATE INDEX IF NOT EXISTS run_attempts_scheduled_idx
 	ON run_attempts (scheduled_for);
+
+CREATE TABLE IF NOT EXISTS run_idempotency_keys (
+	scope     TEXT NOT NULL,
+	job_id    TEXT NOT NULL,
+	idemp_key TEXT NOT NULL,
+	run_id    TEXT NOT NULL,
+	fingerprint TEXT NOT NULL,
+	result_attempt INTEGER NOT NULL,
+	PRIMARY KEY (scope, job_id, idemp_key)
+);
 `

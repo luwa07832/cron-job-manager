@@ -147,6 +147,7 @@ go run .
 - 所有时间均为 UTC RFC3339（允许携带偏移量，服务会归一化为 UTC）；`started_at` 不得早于 `scheduled_for`，`finished_at` 不得早于 `started_at`（相等允许）。
 - `outcome` 仅允许 `succeeded` 或 `failed`：成功时 `error` 省略或为 `null`；失败时 `error` 必须是非空白字符串。
 - 成功返回 HTTP 201，结构与 `GET .../runs/{run_id}` 相同。
+- 可选 `idempotency_key`：提供时在该任务范围内作用，必须是非空白字符串且不超过 128 个 Unicode 字符；省略或为 `null` 时保持原有行为，每次请求都创建新执行。首次携带合法 key 的请求创建执行并记录 key；同任务、同 key、同请求语义的重放（含并发重发）不再生成新的 `run_id`，仍返回 HTTP 201、同一 `run_id` 与完全相同的响应体，各成功请求拿到同一响应。请求语义以 `scheduled_for`、`started_at`、`finished_at`、`outcome`、`error` 按上述规则解析、归一化后是否一致为准（例如携带偏移量但表示同一时刻视为相同）。同任务复用 key 但语义不同时返回 HTTP 409 `idempotency_conflict`，不新增执行。
 
 ### `POST /api/v1/jobs/{id}/runs/{run_id}/retries`
 
@@ -161,6 +162,10 @@ go run .
 ```
 
 仅当该执行最新一个结果为 `failed` 时允许重试，否则返回 409 `retry_not_allowed`。成功返回 HTTP 201 与该执行的完整结果列表。
+
+请求体可选 `idempotency_key`，规则与登记执行一致：key 由任务与 `run_id` 共同限定，必须是非空白且不超过 128 个 Unicode 字符的字符串。首次携带合法 key 的重试追加 attempt 并返回 HTTP 201 与当时的完整结果列表；同 key、同语义的重放（含并发）不追加 attempt，仍返回 HTTP 201 与首次写入时的同一结果列表，即使该执行之后又追加了新的重试，重放响应也保持不变。同一 run 上以已有 key 提交不同语义，或 key 已属于同一任务的其他 run 时，返回 HTTP 409 `idempotency_conflict`。
+
+空白或超长 key 返回 HTTP 422 `idempotency_key_invalid`。未先通过 JSON、任务、时间、结果或重试条件校验的请求不会占用 key；原有的 `job_not_found`、`run_not_found`、`run_time_invalid`、`run_outcome_invalid`、`retry_not_allowed` 结果保持不变。
 
 ### `GET /api/v1/jobs/{id}/runs/{run_id}`
 
@@ -223,6 +228,8 @@ go run .
 | 404 | `route_not_found` | 请求未匹配任何路由 |
 | 404 | `run_not_found` | 读取或重试的执行不存在 |
 | 409 | `retry_not_allowed` | 执行最新结果不是 `failed`，不能追加重试 |
+| 409 | `idempotency_conflict` | 幂等键已在同一任务（重试为同一 run）内使用，但请求语义不同或属于其他执行 |
+| 422 | `idempotency_key_invalid` | `idempotency_key` 为空白或超过 128 个 Unicode 字符 |
 | 409 | `next_run_conflict` | `expected_next_run` 与当前 `next_run` 不一致，或游标已被并发推进 |
 | 409 | `dispatch_not_due` | 当前 `next_run` 晚于 `before`，没有到期的触发时刻 |
 | 422 | `dispatch_time_invalid` | `expected_next_run` 或 `before` 缺失或格式非法 |

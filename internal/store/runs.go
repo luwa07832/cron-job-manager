@@ -14,6 +14,10 @@ var ErrRunNotFound = errors.New("store: run not found")
 // no further retry may be appended.
 var ErrRetryNotAllowed = errors.New("store: run retry not allowed")
 
+// ErrIdempotencyConflict reports that an idempotency key is already stored
+// for the scope but with different request semantics.
+var ErrIdempotencyConflict = errors.New("store: idempotency key conflict")
+
 // Attempt is one recorded execution attempt of a job. Time fields are UTC.
 type Attempt struct {
 	JobID        string
@@ -120,6 +124,150 @@ func (s *Store) AppendRetry(jobID, runID string, startedAt, finishedAt time.Time
 		return nil, err
 	}
 	return attempt, nil
+}
+
+// IdempotencyRequest carries an optional idempotency key and the normalized
+// request fingerprint. When Key is empty the write keeps its legacy behavior
+// and no idempotency record is created.
+type IdempotencyRequest struct {
+	Key         string
+	Fingerprint string
+}
+
+// CreateRunWithIdempotency records the first attempt of a run, optionally
+// deduplicating concurrent replays by an idempotency key scoped to the job.
+// When the key was already stored it returns the previously created run and
+// ErrIdempotencyConflict is never returned here on a fingerprint mismatch only
+// when the key is reused with different semantics.
+func (s *Store) CreateRunWithIdempotency(attempt *Attempt, idem *IdempotencyRequest) (*Run, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if idem != nil && idem.Key != "" {
+		existing, err := findIdempotencyKey(tx, idempotencyScopeRun, attempt.JobID, idem.Key)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			if existing.fingerprint != idem.Fingerprint {
+				return nil, ErrIdempotencyConflict
+			}
+			run, err := runSnapshot(tx, attempt.JobID, existing.runID, existing.resultAttempt)
+			if err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return run, nil
+		}
+	}
+
+	if err := insertAttempt(tx, attempt); err != nil {
+		return nil, err
+	}
+	if idem != nil && idem.Key != "" {
+		if err := insertIdempotencyKey(tx, idempotencyScopeRun, attempt.JobID, idem.Key,
+			attempt.RunID, idem.Fingerprint, 1); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &Run{
+		JobID:        attempt.JobID,
+		RunID:        attempt.RunID,
+		ScheduledFor: attempt.ScheduledFor,
+		Attempts:     []*Attempt{attempt},
+	}, nil
+}
+
+// AppendRetryWithIdempotency appends a retry, optionally deduplicating
+// replays by an idempotency key scoped to the job and run. It returns the run
+// state corresponding to the stored response for the key (all attempts up to
+// and including the one recorded by the keyed write), ErrRunNotFound when the
+// run is unknown and ErrRetryNotAllowed when the latest attempt is not failed.
+// A stored key with different semantics yields ErrIdempotencyConflict.
+func (s *Store) AppendRetryWithIdempotency(jobID, runID string, startedAt, finishedAt time.Time, outcome string, failure *string, idem *IdempotencyRequest) (*Run, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var scheduledNS int64
+	var maxAttempt int
+	var lastOutcome string
+	err = tx.QueryRow(
+		`SELECT scheduled_for, attempt, outcome
+		   FROM run_attempts
+		  WHERE job_id = ? AND run_id = ?
+		  ORDER BY attempt DESC
+		  LIMIT 1`,
+		jobID, runID,
+	).Scan(&scheduledNS, &maxAttempt, &lastOutcome)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrRunNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if idem != nil && idem.Key != "" {
+		existing, err := findIdempotencyKey(tx, idempotencyScopeRetry, jobID, idem.Key)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			if existing.fingerprint != idem.Fingerprint || existing.runID != runID {
+				return nil, ErrIdempotencyConflict
+			}
+			run, err := runSnapshot(tx, jobID, existing.runID, existing.resultAttempt)
+			if err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return run, nil
+		}
+	}
+
+	if lastOutcome != "failed" {
+		return nil, ErrRetryNotAllowed
+	}
+
+	attempt := &Attempt{
+		JobID:        jobID,
+		RunID:        runID,
+		Attempt:      maxAttempt + 1,
+		ScheduledFor: time.Unix(0, scheduledNS).UTC(),
+		StartedAt:    startedAt.UTC(),
+		FinishedAt:   finishedAt.UTC(),
+		Outcome:      outcome,
+		Error:        failure,
+	}
+	if err := insertAttempt(tx, attempt); err != nil {
+		return nil, err
+	}
+	if idem != nil && idem.Key != "" {
+		if err := insertIdempotencyKey(tx, idempotencyScopeRetry, jobID, idem.Key,
+			runID, idem.Fingerprint, attempt.Attempt); err != nil {
+			return nil, err
+		}
+	}
+	run, err := runSnapshot(tx, jobID, runID, attempt.Attempt)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return run, nil
 }
 
 // GetRun fetches one run with all of its attempts ordered ascending. It
@@ -235,6 +383,81 @@ func (s *Store) ExecutedAttempts(from, to time.Time) ([]*Attempt, error) {
 		return nil, err
 	}
 	return attempts, nil
+}
+
+const (
+	idempotencyScopeRun   = "run"
+	idempotencyScopeRetry = "retry"
+)
+
+type storedIdempotencyKey struct {
+	runID         string
+	fingerprint   string
+	resultAttempt int
+}
+
+// findIdempotencyKey returns the stored key for the scope or nil when unused.
+func findIdempotencyKey(tx *sql.Tx, scope, jobID, key string) (*storedIdempotencyKey, error) {
+	stored := &storedIdempotencyKey{}
+	err := tx.QueryRow(
+		`SELECT run_id, fingerprint, result_attempt
+		   FROM run_idempotency_keys
+		  WHERE scope = ? AND job_id = ? AND idemp_key = ?`,
+		scope, jobID, key,
+	).Scan(&stored.runID, &stored.fingerprint, &stored.resultAttempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return stored, nil
+}
+
+// insertIdempotencyKey reserves the key. It is called inside the same
+// transaction as the write, so a concurrent inserter that wins the primary
+// key races with the attempt insert and both cannot succeed.
+func insertIdempotencyKey(tx *sql.Tx, scope, jobID, key, runID, fingerprint string, resultAttempt int) error {
+	_, err := tx.Exec(
+		`INSERT INTO run_idempotency_keys
+		    (scope, job_id, idemp_key, run_id, fingerprint, result_attempt)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		scope, jobID, key, runID, fingerprint, resultAttempt,
+	)
+	if isUniqueConstraint(err) {
+		return ErrIdempotencyConflict
+	}
+	return err
+}
+
+// runSnapshot reconstructs the response that the original keyed write
+// returned: the run header together with attempts up to maxAttempt inclusive.
+func runSnapshot(tx *sql.Tx, jobID, runID string, maxAttempt int) (*Run, error) {
+	rows, err := tx.Query(
+		`SELECT job_id, run_id, attempt, scheduled_for, started_at, finished_at, outcome, error
+		   FROM run_attempts
+		  WHERE job_id = ? AND run_id = ? AND attempt <= ?
+		  ORDER BY attempt ASC`,
+		jobID, runID, maxAttempt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRun(rows)
+}
+
+// insertAttempt writes one execution attempt row.
+func insertAttempt(tx *sql.Tx, attempt *Attempt) error {
+	_, err := tx.Exec(
+		`INSERT INTO run_attempts
+		    (job_id, run_id, attempt, scheduled_for, started_at, finished_at, outcome, error)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		attempt.JobID, attempt.RunID, attempt.Attempt,
+		attempt.ScheduledFor.UnixNano(), attempt.StartedAt.UnixNano(),
+		attempt.FinishedAt.UnixNano(), attempt.Outcome, nullableString(attempt.Error),
+	)
+	return err
 }
 
 func scanRun(rows *sql.Rows) (*Run, error) {

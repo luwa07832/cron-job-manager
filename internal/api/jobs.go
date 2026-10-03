@@ -423,6 +423,14 @@ var (
 		status: http.StatusUnprocessableEntity, code: "run_outcome_invalid",
 		message: "outcome must be succeeded or failed, with error omitted on success and non-blank on failure",
 	}
+	errIdempotencyKeyInvalid = &jobError{
+		status: http.StatusUnprocessableEntity, code: "idempotency_key_invalid",
+		message: "idempotency_key must be a non-empty string of at most 128 characters",
+	}
+	errIdempotencyConflict = &jobError{
+		status: http.StatusConflict, code: "idempotency_conflict",
+		message: "the idempotency key was already used with different request semantics",
+	}
 	errStorageUnavailable = &jobError{
 		status: http.StatusServiceUnavailable, code: "storage_unavailable",
 		message: "database is not available",

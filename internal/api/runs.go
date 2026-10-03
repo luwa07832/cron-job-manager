@@ -1,10 +1,12 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -12,18 +14,20 @@ import (
 )
 
 type createRunRequest struct {
-	ScheduledFor *string `json:"scheduled_for"`
-	StartedAt    string  `json:"started_at"`
-	FinishedAt   string  `json:"finished_at"`
-	Outcome      string  `json:"outcome"`
-	Error        *string `json:"error"`
+	ScheduledFor   *string `json:"scheduled_for"`
+	StartedAt      string  `json:"started_at"`
+	FinishedAt     string  `json:"finished_at"`
+	Outcome        string  `json:"outcome"`
+	Error          *string `json:"error"`
+	IdempotencyKey *string `json:"idempotency_key"`
 }
 
 type retryRunRequest struct {
-	StartedAt  string  `json:"started_at"`
-	FinishedAt string  `json:"finished_at"`
-	Outcome    string  `json:"outcome"`
-	Error      *string `json:"error"`
+	StartedAt      string  `json:"started_at"`
+	FinishedAt     string  `json:"finished_at"`
+	Outcome        string  `json:"outcome"`
+	Error          *string `json:"error"`
+	IdempotencyKey *string `json:"idempotency_key"`
 }
 
 type attemptResponse struct {
@@ -86,6 +90,11 @@ func createRun(st *store.Store) gin.HandlerFunc {
 		if !ok {
 			return
 		}
+		idem, ok := parseIdempotencyKey(c, request.IdempotencyKey)
+		if !ok {
+			return
+		}
+		fingerprint := runFingerprint(scheduledFor, startedAt, finishedAt, outcome, failure)
 
 		attempt := &store.Attempt{
 			JobID:        jobID,
@@ -97,16 +106,15 @@ func createRun(st *store.Store) gin.HandlerFunc {
 			Outcome:      outcome,
 			Error:        failure,
 		}
-		if err := st.CreateRun(attempt); err != nil {
-			writeJobError(c, errStorageUnavailable)
+		if idem != nil {
+			idem.Fingerprint = fingerprint
+		}
+		run, err := st.CreateRunWithIdempotency(attempt, idem)
+		if err != nil {
+			writeRunWriteError(c, err)
 			return
 		}
-		c.JSON(http.StatusCreated, toRunResponse(&store.Run{
-			JobID:        attempt.JobID,
-			RunID:        attempt.RunID,
-			ScheduledFor: attempt.ScheduledFor,
-			Attempts:     []*store.Attempt{attempt},
-		}))
+		c.JSON(http.StatusCreated, toRunResponse(run))
 	}
 }
 
@@ -133,6 +141,35 @@ func retryRun(st *store.Store) gin.HandlerFunc {
 			return
 		}
 		latest := run.Attempts[len(run.Attempts)-1]
+
+		idem, ok := parseIdempotencyKey(c, request.IdempotencyKey)
+		if !ok {
+			return
+		}
+
+		// A keyed replay must return the stored response even when the run
+		// has since advanced past failure, so key handling precedes the
+		// latest-attempt gate. Semantic validation stays first so that
+		// malformed requests never reserve the key.
+		if idem != nil {
+			startedAt, finishedAt, ok := parseRunTimes(c, latest.ScheduledFor, request.StartedAt, request.FinishedAt)
+			if !ok {
+				return
+			}
+			outcome, failure, ok := validateOutcome(c, request.Outcome, request.Error)
+			if !ok {
+				return
+			}
+			idem.Fingerprint = runFingerprint(latest.ScheduledFor, startedAt, finishedAt, outcome, failure)
+			fresh, err := st.AppendRetryWithIdempotency(jobID, runID, startedAt, finishedAt, outcome, failure, idem)
+			if err != nil {
+				writeRunWriteError(c, err)
+				return
+			}
+			c.JSON(http.StatusCreated, toRunResponse(fresh))
+			return
+		}
+
 		if latest.Outcome != "failed" {
 			writeJobError(c, errRetryNotAllowed)
 			return
@@ -147,14 +184,9 @@ func retryRun(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		if _, err := st.AppendRetry(jobID, runID, startedAt, finishedAt, outcome, failure); err != nil {
-			writeRunWriteError(c, err)
-			return
-		}
-
-		fresh, err := st.GetRun(jobID, runID)
+		fresh, err := st.AppendRetryWithIdempotency(jobID, runID, startedAt, finishedAt, outcome, failure, nil)
 		if err != nil {
-			writeRunLookupError(c, err)
+			writeRunWriteError(c, err)
 			return
 		}
 		c.JSON(http.StatusCreated, toRunResponse(fresh))
@@ -189,6 +221,52 @@ func listJobRuns(st *store.Store) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, responses)
 	}
+}
+
+// maxIdempotencyKeyRunes bounds the key by Unicode code points, not bytes.
+const maxIdempotencyKeyRunes = 128
+
+// parseIdempotencyKey validates the optional key. A nil or omitted field
+// keeps the legacy behavior; a blank or over-long value is rejected and such
+// requests never reserve the key.
+func parseIdempotencyKey(c *gin.Context, value *string) (*store.IdempotencyRequest, bool) {
+	if value == nil {
+		return nil, true
+	}
+	if strings.TrimSpace(*value) == "" || utf8.RuneCountInString(*value) > maxIdempotencyKeyRunes {
+		writeJobError(c, errIdempotencyKeyInvalid)
+		return nil, false
+	}
+	return &store.IdempotencyRequest{Key: *value}, true
+}
+
+// runFingerprint serializes the request semantics after normalization. All
+// instants are UTC RFC3339; the error pointer distinguishes omitted/null from
+// a concrete failure message. Field order is fixed by the struct, making the
+// encoding stable for byte comparison.
+type runFingerprintPayload struct {
+	ScheduledFor string  `json:"scheduled_for"`
+	StartedAt    string  `json:"started_at"`
+	FinishedAt   string  `json:"finished_at"`
+	Outcome      string  `json:"outcome"`
+	Error        *string `json:"error"`
+}
+
+func runFingerprint(scheduledFor, startedAt, finishedAt time.Time, outcome string, failure *string) string {
+	payload := runFingerprintPayload{
+		ScheduledFor: formatTime(scheduledFor),
+		StartedAt:    formatTime(startedAt),
+		FinishedAt:   formatTime(finishedAt),
+		Outcome:      outcome,
+		Error:        failure,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		// The payload contains only strings and a nilable string, so
+		// encoding cannot fail; keep a deterministic fallback anyway.
+		return payload.ScheduledFor + "|" + payload.StartedAt + "|" + payload.FinishedAt + "|" + payload.Outcome
+	}
+	return string(encoded)
 }
 
 func parseRunWindow(c *gin.Context, scheduledText, startedText, finishedText string) (time.Time, time.Time, time.Time, bool) {
@@ -281,6 +359,8 @@ func writeRunWriteError(c *gin.Context, err error) {
 		writeJobError(c, errRunNotFound)
 	case errors.Is(err, store.ErrRetryNotAllowed):
 		writeJobError(c, errRetryNotAllowed)
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		writeJobError(c, errIdempotencyConflict)
 	default:
 		writeJobError(c, errStorageUnavailable)
 	}
