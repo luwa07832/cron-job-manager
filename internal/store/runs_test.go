@@ -310,3 +310,98 @@ func TestRunsForJobWindowOrderAndDeleted(t *testing.T) {
 }
 
 func strp(value string) *string { return &value }
+
+func TestCreateRunIdempotentReplayAndConflict(t *testing.T) {
+	st := newTestStore(t)
+	createJobForRun(t, st, "job-1")
+
+	scheduled := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	failure := "boom"
+	first := &Attempt{
+		JobID: "job-1", RunID: "run-first", ScheduledFor: scheduled,
+		StartedAt: scheduled.Add(time.Minute), FinishedAt: scheduled.Add(2 * time.Minute),
+		Outcome: "failed", Error: &failure,
+	}
+	run, err := st.CreateRunIdempotent(first, "key-1", "fp-1")
+	if err != nil || run.RunID != "run-first" || len(run.Attempts) != 1 {
+		t.Fatalf("first = %+v, %v", run, err)
+	}
+
+	// Replay with a freshly generated run id returns the stored run.
+	replayAttempt := *first
+	replayAttempt.RunID = "run-replay-guess"
+	replay, err := st.CreateRunIdempotent(&replayAttempt, "key-1", "fp-1")
+	if err != nil || replay.RunID != "run-first" || len(replay.Attempts) != 1 {
+		t.Fatalf("replay = %+v, %v", replay, err)
+	}
+
+	// Different fingerprint conflicts without writing the new run.
+	conflicting := &Attempt{
+		JobID: "job-1", RunID: "run-other", ScheduledFor: scheduled.Add(time.Hour),
+		StartedAt: scheduled.Add(2 * time.Hour), FinishedAt: scheduled.Add(3 * time.Hour),
+		Outcome: "succeeded",
+	}
+	if _, err := st.CreateRunIdempotent(conflicting, "key-1", "fp-2"); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("conflict err = %v", err)
+	}
+	if _, err := st.GetRun("job-1", "run-other"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("conflicting run was written: %v", err)
+	}
+
+	// Keys are job scoped.
+	createJobForRun(t, st, "job-2")
+	other, err := st.CreateRunIdempotent(&Attempt{
+		JobID: "job-2", RunID: "run-j2", ScheduledFor: scheduled,
+		StartedAt: scheduled, FinishedAt: scheduled.Add(time.Minute),
+		Outcome: "succeeded",
+	}, "key-1", "fp-9")
+	if err != nil || other.RunID != "run-j2" {
+		t.Fatalf("cross-job key = %+v, %v", other, err)
+	}
+}
+
+func TestAppendRetryIdempotentReplayConflictAndGuards(t *testing.T) {
+	st := newTestStore(t)
+	createJobForRun(t, st, "job-1")
+
+	scheduled := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	failure := "boom"
+	if _, err := st.CreateRunIdempotent(&Attempt{
+		JobID: "job-1", RunID: "run-1", ScheduledFor: scheduled,
+		StartedAt: scheduled, FinishedAt: scheduled.Add(time.Minute),
+		Outcome: "failed", Error: &failure,
+	}, "create-key", "fp"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := st.AppendRetryIdempotent("job-1", "ghost", "rk", "f",
+		scheduled.Add(2*time.Minute), scheduled.Add(3*time.Minute), "succeeded", nil); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("missing run err = %v", err)
+	}
+
+	first, err := st.AppendRetryIdempotent("job-1", "run-1", "rk", "f",
+		scheduled.Add(2*time.Minute), scheduled.Add(3*time.Minute), "succeeded", nil)
+	if err != nil || len(first.Attempts) != 2 {
+		t.Fatalf("retry = %+v, %v", first, err)
+	}
+
+	// Replay of the same request still returns the stored two-attempt run
+	// even though the run is now terminal.
+	replay, err := st.AppendRetryIdempotent("job-1", "run-1", "rk", "f",
+		scheduled.Add(2*time.Minute), scheduled.Add(3*time.Minute), "succeeded", nil)
+	if err != nil || len(replay.Attempts) != 2 {
+		t.Fatalf("replay = %+v, %v", replay, err)
+	}
+
+	// Same key, other semantics conflicts rather than retry_not_allowed.
+	if _, err := st.AppendRetryIdempotent("job-1", "run-1", "rk", "different",
+		scheduled.Add(4*time.Minute), scheduled.Add(5*time.Minute), "succeeded", nil); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("conflict err = %v", err)
+	}
+
+	// A different key against the terminal run hits the state guard.
+	if _, err := st.AppendRetryIdempotent("job-1", "run-1", "rk-2", "f2",
+		scheduled.Add(4*time.Minute), scheduled.Add(5*time.Minute), "succeeded", nil); !errors.Is(err, ErrRetryNotAllowed) {
+		t.Fatalf("guard err = %v", err)
+	}
+}

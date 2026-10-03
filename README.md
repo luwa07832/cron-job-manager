@@ -147,6 +147,10 @@ go run .
 - 所有时间均为 UTC RFC3339（允许携带偏移量，服务会归一化为 UTC）；`started_at` 不得早于 `scheduled_for`，`finished_at` 不得早于 `started_at`（相等允许）。
 - `outcome` 仅允许 `succeeded` 或 `failed`：成功时 `error` 省略或为 `null`；失败时 `error` 必须是非空白字符串。
 - 成功返回 HTTP 201，结构与 `GET .../runs/{run_id}` 相同。
+- 可选 `idempotency_key`：提供时在该任务范围内唯一标识本次业务事件，必须是非空白字符串且不超过 128 个 Unicode 字符；省略或为 `null` 时保持无幂等的既有行为（每次都新建执行）。
+  - 相同任务携带相同 key、且 `scheduled_for`、`started_at`、`finished_at`、`outcome`、`error` 归一化后语义一致的重放，不再生成新的 `run_id`，仍返回 HTTP 201、同一 `run_id` 与首次完全相同的响应体（携带偏移量的等价时间戳视为同一语义）。
+  - 相同任务复用已有 key 但语义不同，返回 HTTP 409 `idempotency_conflict`，不新增执行；key 在不同任务间互不影响。
+  - 空白或超长 key 返回 HTTP 422 `idempotency_key_invalid`。未先通过 JSON、任务、时间或结果校验的请求不会占用 key（原有错误码不变）。并发的相同请求只会创建一次，各成功请求得到同一响应。
 
 ### `POST /api/v1/jobs/{id}/runs/{run_id}/retries`
 
@@ -161,6 +165,12 @@ go run .
 ```
 
 仅当该执行最新一个结果为 `failed` 时允许重试，否则返回 409 `retry_not_allowed`。成功返回 HTTP 201 与该执行的完整结果列表。
+
+可选 `idempotency_key` 按任务与 `run_id` 共同限定，规则与首次登记一致：
+
+- 相同 key 与相同请求语义（`started_at`、`finished_at`、`outcome`、`error` 归一化后）的重放不追加 attempt，仍返回 HTTP 201 与首次记录时完全相同的结果列表快照。
+- 相同 key 语义不同返回 HTTP 409 `idempotency_conflict`；空白或超长 key 返回 HTTP 422 `idempotency_key_invalid`。
+- 未先通过 JSON、任务、时间、结果或重试条件校验的请求不占用 key，`job_not_found`、`run_not_found`、`run_time_invalid`、`run_outcome_invalid`、`retry_not_allowed` 的行为保持不变。
 
 ### `GET /api/v1/jobs/{id}/runs/{run_id}`
 

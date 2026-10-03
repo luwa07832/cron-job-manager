@@ -217,6 +217,11 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// sqlQueryer is satisfied by both *sql.DB and *sql.Tx.
+type sqlQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 func (s *Store) queryJob(query string, args ...any) (*Job, error) {
 	row := s.db.QueryRow(query, args...)
 	job, err := scanJob(row)
@@ -299,4 +304,24 @@ CREATE INDEX IF NOT EXISTS run_attempts_run_idx
 
 CREATE INDEX IF NOT EXISTS run_attempts_scheduled_idx
 	ON run_attempts (scheduled_for);
+
+CREATE TABLE IF NOT EXISTS run_idempotency_keys (
+	job_id              TEXT NOT NULL,
+	idempotency_key     TEXT NOT NULL,
+	run_id              TEXT NOT NULL,
+	request_fingerprint TEXT NOT NULL,
+	result_attempt_count INTEGER NOT NULL,
+	created_at          INTEGER NOT NULL,
+	PRIMARY KEY (job_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS retry_idempotency_keys (
+	job_id              TEXT NOT NULL,
+	run_id              TEXT NOT NULL,
+	idempotency_key     TEXT NOT NULL,
+	request_fingerprint TEXT NOT NULL,
+	result_attempt_count INTEGER NOT NULL,
+	created_at          INTEGER NOT NULL,
+	PRIMARY KEY (job_id, run_id, idempotency_key)
+);
 `

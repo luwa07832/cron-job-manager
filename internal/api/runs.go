@@ -1,10 +1,14 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -12,18 +16,20 @@ import (
 )
 
 type createRunRequest struct {
-	ScheduledFor *string `json:"scheduled_for"`
-	StartedAt    string  `json:"started_at"`
-	FinishedAt   string  `json:"finished_at"`
-	Outcome      string  `json:"outcome"`
-	Error        *string `json:"error"`
+	ScheduledFor   *string `json:"scheduled_for"`
+	StartedAt      string  `json:"started_at"`
+	FinishedAt     string  `json:"finished_at"`
+	Outcome        string  `json:"outcome"`
+	Error          *string `json:"error"`
+	IdempotencyKey *string `json:"idempotency_key"`
 }
 
 type retryRunRequest struct {
-	StartedAt  string  `json:"started_at"`
-	FinishedAt string  `json:"finished_at"`
-	Outcome    string  `json:"outcome"`
-	Error      *string `json:"error"`
+	StartedAt      string  `json:"started_at"`
+	FinishedAt     string  `json:"finished_at"`
+	Outcome        string  `json:"outcome"`
+	Error          *string `json:"error"`
+	IdempotencyKey *string `json:"idempotency_key"`
 }
 
 type attemptResponse struct {
@@ -86,6 +92,10 @@ func createRun(st *store.Store) gin.HandlerFunc {
 		if !ok {
 			return
 		}
+		key, ok := validateIdempotencyKey(c, request.IdempotencyKey)
+		if !ok {
+			return
+		}
 
 		attempt := &store.Attempt{
 			JobID:        jobID,
@@ -97,16 +107,27 @@ func createRun(st *store.Store) gin.HandlerFunc {
 			Outcome:      outcome,
 			Error:        failure,
 		}
-		if err := st.CreateRun(attempt); err != nil {
-			writeJobError(c, errStorageUnavailable)
+		if key == "" {
+			if err := st.CreateRun(attempt); err != nil {
+				writeJobError(c, errStorageUnavailable)
+				return
+			}
+			c.JSON(http.StatusCreated, toRunResponse(&store.Run{
+				JobID:        attempt.JobID,
+				RunID:        attempt.RunID,
+				ScheduledFor: attempt.ScheduledFor,
+				Attempts:     []*store.Attempt{attempt},
+			}))
 			return
 		}
-		c.JSON(http.StatusCreated, toRunResponse(&store.Run{
-			JobID:        attempt.JobID,
-			RunID:        attempt.RunID,
-			ScheduledFor: attempt.ScheduledFor,
-			Attempts:     []*store.Attempt{attempt},
-		}))
+
+		fingerprint := runFingerprint(scheduledFor, startedAt, finishedAt, outcome, failure)
+		run, err := st.CreateRunIdempotent(attempt, key, fingerprint)
+		if err != nil {
+			writeRunWriteError(c, err)
+			return
+		}
+		c.JSON(http.StatusCreated, toRunResponse(run))
 	}
 }
 
@@ -132,13 +153,41 @@ func retryRun(st *store.Store) gin.HandlerFunc {
 			writeRunLookupError(c, err)
 			return
 		}
-		latest := run.Attempts[len(run.Attempts)-1]
-		if latest.Outcome != "failed" {
-			writeJobError(c, errRetryNotAllowed)
+
+		// Without a key the historical ordering is preserved exactly: the
+		// retry condition is rejected before request fields are parsed.
+		if request.IdempotencyKey == nil {
+			latest := run.Attempts[len(run.Attempts)-1]
+			if latest.Outcome != "failed" {
+				writeJobError(c, errRetryNotAllowed)
+				return
+			}
+			startedAt, finishedAt, ok := parseRunTimes(c, run.ScheduledFor, request.StartedAt, request.FinishedAt)
+			if !ok {
+				return
+			}
+			outcome, failure, ok := validateOutcome(c, request.Outcome, request.Error)
+			if !ok {
+				return
+			}
+			if _, err := st.AppendRetry(jobID, runID, startedAt, finishedAt, outcome, failure); err != nil {
+				writeRunWriteError(c, err)
+				return
+			}
+			fresh, err := st.GetRun(jobID, runID)
+			if err != nil {
+				writeRunLookupError(c, err)
+				return
+			}
+			c.JSON(http.StatusCreated, toRunResponse(fresh))
 			return
 		}
 
-		startedAt, finishedAt, ok := parseRunTimes(c, latest.ScheduledFor, request.StartedAt, request.FinishedAt)
+		key, ok := validateIdempotencyKey(c, request.IdempotencyKey)
+		if !ok {
+			return
+		}
+		startedAt, finishedAt, ok := parseRunTimes(c, run.ScheduledFor, request.StartedAt, request.FinishedAt)
 		if !ok {
 			return
 		}
@@ -147,14 +196,13 @@ func retryRun(st *store.Store) gin.HandlerFunc {
 			return
 		}
 
-		if _, err := st.AppendRetry(jobID, runID, startedAt, finishedAt, outcome, failure); err != nil {
-			writeRunWriteError(c, err)
-			return
-		}
-
-		fresh, err := st.GetRun(jobID, runID)
+		// The atomic store call decides replay versus conflict versus
+		// retry_not_allowed, so a matching replay of a request whose run is
+		// now terminal still returns the original response.
+		fingerprint := retryFingerprint(startedAt, finishedAt, outcome, failure)
+		fresh, err := st.AppendRetryIdempotent(jobID, runID, key, fingerprint, startedAt, finishedAt, outcome, failure)
 		if err != nil {
-			writeRunLookupError(c, err)
+			writeRunWriteError(c, err)
 			return
 		}
 		c.JSON(http.StatusCreated, toRunResponse(fresh))
@@ -222,6 +270,72 @@ func parseRunTimes(c *gin.Context, scheduledFor time.Time, startedText, finished
 	return startedAt, finishedAt, true
 }
 
+const maxIdempotencyKeyLength = 128
+
+// validateIdempotencyKey normalizes the optional field: an absent or null key
+// means "no idempotency" and keeps the legacy behavior, while a present key
+// must be non-blank and no longer than 128 Unicode characters.
+func validateIdempotencyKey(c *gin.Context, value *string) (string, bool) {
+	if value == nil {
+		return "", true
+	}
+	key := *value
+	if strings.TrimSpace(key) == "" || utf8.RuneCountInString(key) > maxIdempotencyKeyLength {
+		writeJobError(c, errIdempotencyKeyInvalid)
+		return "", false
+	}
+	return key, true
+}
+
+// requestFingerprint is the canonical form of the fields that define request
+// semantics; times are normalized to UTC and stored at nanosecond precision so
+// that offset-bearing but equivalent timestamps replay identically.
+type requestFingerprint struct {
+	ScheduledFor int64   `json:"scheduled_for"`
+	StartedAt    int64   `json:"started_at"`
+	FinishedAt   int64   `json:"finished_at"`
+	Outcome      string  `json:"outcome"`
+	Error        *string `json:"error"`
+}
+
+// retryFingerprintShape omits scheduled_for, which retries never carry.
+type retryFingerprintShape struct {
+	StartedAt  int64   `json:"started_at"`
+	FinishedAt int64   `json:"finished_at"`
+	Outcome    string  `json:"outcome"`
+	Error      *string `json:"error"`
+}
+
+func runFingerprint(scheduledFor, startedAt, finishedAt time.Time, outcome string, failure *string) string {
+	return fingerprintOf(requestFingerprint{
+		ScheduledFor: scheduledFor.UnixNano(),
+		StartedAt:    startedAt.UnixNano(),
+		FinishedAt:   finishedAt.UnixNano(),
+		Outcome:      outcome,
+		Error:        failure,
+	})
+}
+
+func retryFingerprint(startedAt, finishedAt time.Time, outcome string, failure *string) string {
+	return fingerprintOf(retryFingerprintShape{
+		StartedAt:  startedAt.UnixNano(),
+		FinishedAt: finishedAt.UnixNano(),
+		Outcome:    outcome,
+		Error:      failure,
+	})
+}
+
+func fingerprintOf(shape any) string {
+	encoded, err := json.Marshal(shape)
+	if err != nil {
+		// All shapes are plain structs of strings and numbers; marshalling
+		// cannot realistically fail.
+		panic(err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
 func validateOutcome(c *gin.Context, outcome string, failure *string) (string, *string, bool) {
 	if outcome != "succeeded" && outcome != "failed" {
 		writeJobError(c, errRunOutcomeInvalid)
@@ -281,6 +395,8 @@ func writeRunWriteError(c *gin.Context, err error) {
 		writeJobError(c, errRunNotFound)
 	case errors.Is(err, store.ErrRetryNotAllowed):
 		writeJobError(c, errRetryNotAllowed)
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		writeJobError(c, errIdempotencyConflict)
 	default:
 		writeJobError(c, errStorageUnavailable)
 	}
